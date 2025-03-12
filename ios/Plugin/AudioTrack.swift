@@ -14,6 +14,7 @@ final class AudioTrack: AVPlayerItem {
     var artist: String?
     var album: String?
     var title: String?
+    var httpHeaders: [String: String]?
 
     class func initWithDictionary(_ trackInfo: [String : Any]?) -> AudioTrack? {
         guard
@@ -25,7 +26,16 @@ final class AudioTrack: AVPlayerItem {
         else {
             return nil
         }
-        let track = AudioTrack(url: assetUrl)
+   
+        let headers = [
+    "Authorization": "Bearer YourBearerTokenHere",
+    // Include any other headers your server requires
+]
+        let httpHeaders = trackInfo["httpHeaders"] as? [String: String]
+        
+        let options: [String: Any]? = httpHeaders != nil ? ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders!] : nil
+        let asset = AVURLAsset(url: assetUrl, options: options)
+        let track = AudioTrack(asset: asset)
         track.canUseNetworkResourcesForLiveStreamingWhilePaused = true
 
         if let isStreamStr = trackInfo["isStream"] as? NSString {
@@ -52,7 +62,8 @@ final class AudioTrack: AVPlayerItem {
             "albumArt": albumArt?.absoluteString ?? "",
             "artist": artist ?? "",
             "album": album ?? "",
-            "title": title ?? ""
+            "title": title ?? "",
+            "httpHeaders": httpHeaders ?? ""
         ]
     }
 }
