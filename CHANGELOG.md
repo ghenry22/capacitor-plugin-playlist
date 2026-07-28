@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.11.3
+
+- Fix (Android): AGP 9 compatibility — use `proguard-android-optimize.txt` and drop redundant `kotlin-android` plugin (built-in Kotlin in AGP 9+).
+
 ## 0.11.2
 
 - Fix (Android): Separate playlist identity from track ids so colliding public `trackId` values do not break setup, playback, selection, or removal ([#139](https://github.com/phiamo/capacitor-plugin-playlist/pull/139)).
