@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.11.4
+
+- Fix (Android): apply `kotlin-android` only for standalone/CI builds (AGP < 9); AGP 9+ consuming apps use built-in Kotlin.
+
 ## 0.11.3
 
 - Fix (Android): AGP 9 compatibility — use `proguard-android-optimize.txt` and drop redundant `kotlin-android` plugin (built-in Kotlin in AGP 9+).

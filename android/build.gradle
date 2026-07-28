@@ -13,6 +13,8 @@ buildscript {
     }
 }
 
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 ext {
     junitVersion = project.hasProperty('junitVersion') ? rootProject.ext.junitVersion : '4.13.2'
     androidxJunitVersion = project.hasProperty('androidxJunitVersion') ? rootProject.ext.androidxJunitVersion : '1.3.0'
@@ -23,6 +25,13 @@ ext {
 }
 
 apply plugin: 'com.android.library'
+
+// AGP 9+ (consuming apps) provides built-in Kotlin; applying kotlin-android there fails.
+// Standalone `./gradlew test` (CI) still uses AGP 8.x from this module's buildscript.
+def agpMajorVersion = com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION.tokenize('.')[0].toInteger()
+if (agpMajorVersion < 9) {
+    apply plugin: 'kotlin-android'
+}
 
 android {
     namespace = "org.dwbn.plugins.playlist"
@@ -46,6 +55,14 @@ android {
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_21
         targetCompatibility JavaVersion.VERSION_21
+    }
+}
+
+if (agpMajorVersion < 9) {
+    kotlin {
+        compilerOptions {
+            jvmTarget = JvmTarget.JVM_21
+        }
     }
 }
 
