@@ -73,7 +73,11 @@ final class RmxAudioPlayer: NSObject {
     override init() {
         super.init()
 
-        activateAudioSession()
+        // Deliberately no activateAudioSession() here. The Capacitor bridge
+        // constructs every registered plugin at app launch, so activating the
+        // (non-mixable) .playback session in init interrupts any audio the
+        // user already has playing (e.g. Spotify) the moment the app opens.
+        // The session is activated on demand in playCommand() / resume().
         observeLifeCycle()
     }
 
