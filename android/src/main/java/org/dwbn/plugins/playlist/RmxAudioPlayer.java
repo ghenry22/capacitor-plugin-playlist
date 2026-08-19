@@ -1,5 +1,6 @@
 package org.dwbn.plugins.playlist;
 
+import android.content.Context;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -20,6 +21,8 @@ import org.dwbn.plugins.playlist.data.AudioTrack;
 import org.dwbn.plugins.playlist.manager.MediaControlsListener;
 import org.dwbn.plugins.playlist.manager.Options;
 import org.dwbn.plugins.playlist.manager.PlaylistManager;
+import org.dwbn.plugins.playlist.playlist.AudioPlaylistHandler;
+import org.dwbn.plugins.playlist.service.MediaService;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -37,16 +40,16 @@ public class RmxAudioPlayer implements PlaybackStatusListener<AudioTrack>,
     // It would be used to switch between playlists. I guess we could
     // support that in the future, might be cool.
     private static final int PLAYLIST_ID = 32;
-    private PlaylistManager playlistManager;
+    private final PlaylistManager playlistManager;
     private final OnStatusReportListener statusListener;
 
     private int lastBufferPercent = 0;
     private long lastDuration = 0;
     private boolean trackLoaded = false;
     private boolean resetStreamOnPause = true;
-    private final App app;
+    private final Context context;
 
-    public RmxAudioPlayer(@NonNull OnStatusReportListener statusListener, App context) {
+    public RmxAudioPlayer(@NonNull OnStatusReportListener statusListener, @NonNull Context context) {
         // AudioPlayerPlugin and RmxAudioPlayer are separate classes in order to increase
         // the portability of this code.
         // Because AudioPlayerPlugin itself holds a strong reference to this class,
@@ -54,10 +57,9 @@ public class RmxAudioPlayer implements PlaybackStatusListener<AudioTrack>,
         // but these two objects will always live together (And the plugin couldn't function
         // at all if this one gets garbage collected).
         this.statusListener = statusListener;
-        this.app = context;
+        this.context = context.getApplicationContext();
+        this.playlistManager = PlaylistRuntime.getPlaylistManager(this.context);
 
-        app.resetPlaylistManager();
-        getPlaylistManager();
         playlistManager.setId(PLAYLIST_ID);
         playlistManager.setPlaybackStatusListener(this);
         playlistManager.setOnErrorListener(this);
@@ -65,7 +67,6 @@ public class RmxAudioPlayer implements PlaybackStatusListener<AudioTrack>,
     }
 
     public PlaylistManager getPlaylistManager() {
-        playlistManager = app.getPlaylistManager();
         return playlistManager;
     }
 
@@ -79,7 +80,7 @@ public class RmxAudioPlayer implements PlaybackStatusListener<AudioTrack>,
     }
 
     public void setOptions(JSONObject val) {
-        Options options = new Options(app, val);
+        Options options = new Options(context, val);
         getPlaylistManager().setOptions(options);
     }
 
@@ -410,7 +411,6 @@ public class RmxAudioPlayer implements PlaybackStatusListener<AudioTrack>,
 
     public void resume() {
         Log.i(TAG, "Resumed, wiring up event listeners");
-        getPlaylistManager();
         registerPlaylistListeners();
         //Makes sure to retrieve the current playback information
         updateCurrentPlaybackInformation();
@@ -460,26 +460,88 @@ public class RmxAudioPlayer implements PlaybackStatusListener<AudioTrack>,
         } else {
             lastKnownHandoffPositionSec = 0f;
         }
-        // Pause unconditionally (not only when isPlaying) so that DefaultAudioFocusProvider
-        // always abandons audio focus before CapacitorVideoPlayer.initPlayer acquires it.
-        // Calling pause() on an already-paused handler is safe; it triggers focus release.
-        if (playlistManager.getPlaylistHandler() != null) {
-            playlistManager.getPlaylistHandler().pause(false);
+        com.devbrackets.android.playlistcore.components.playlisthandler.PlaylistHandler<?> handler =
+                playlistManager.getPlaylistHandler();
+        if (handler instanceof AudioPlaylistHandler) {
+            ((AudioPlaylistHandler<?, ?>) handler).pauseForVideoHandoff();
+        } else if (handler != null) {
+            handler.pause(false);
         }
     }
 
-    public void resumeAfterVideoHandoff(float positionSec) {
+    public boolean resumeAfterVideoHandoff(float positionSec) {
+        return resumeAfterVideoHandoff(positionSec, false, true);
+    }
+
+    /**
+     * @return {@code true} when in-place resume already seeked and started playback
+     *         (JS should skip redundant seekTo/play); {@code false} for prewarm, paused handoff,
+     *         or last-resort beginPlayback.
+     */
+    public boolean resumeAfterVideoHandoff(float positionSec, boolean prewarm) {
+        return resumeAfterVideoHandoff(positionSec, prewarm, true);
+    }
+
+    public boolean resumeAfterVideoHandoff(float positionSec, boolean prewarm, boolean play) {
         lastKnownHandoffPositionSec = positionSec;
-        // Re-arm the audio session/service so the handler is primed before JS calls play().
-        // On Android, prepareForVideoHandoff() abandoned audio focus which may have caused
-        // the MediaService to stop itself (foreground service removal). beginPlayback with
-        // startPaused=true restarts the service, re-acquires audio focus, and prepares the
-        // MediaPlayer at the stored position — without auto-starting playback (JS owns FR111).
         long positionMs = (long) (positionSec * 1000f);
+        if (prewarm) {
+            playlistManager.setVideoHandoffForegroundRetain(true);
+            playlistManager.beginPlayback(positionMs, true);
+            return false;
+        }
+        if (!play) {
+            // Paused video exit — do not start audio; JS will seekTo only.
+            playlistManager.setVideoHandoffForegroundRetain(false);
+            return false;
+        }
+        if (tryResumeVideoHandoffInPlace(positionMs)) {
+            return true;
+        }
+        // Service not foreground — last resort (may be muted on Android 17 when backgrounded).
+        playlistManager.setVideoHandoffForegroundRetain(false);
         playlistManager.beginPlayback(positionMs, true);
+        return false;
+    }
+
+    /**
+     * Resume audio at {@code positionMs} without restarting MediaService (Android 17 AudioHardening).
+     */
+    public boolean tryResumeVideoHandoffInPlace(long positionMs) {
+        if (!playlistManager.getVideoHandoffForegroundRetain()) {
+            return false;
+        }
+        MediaService service = MediaService.getInstance();
+        if (service == null || !service.isRunningInForeground()) {
+            return false;
+        }
+        com.devbrackets.android.playlistcore.components.playlisthandler.PlaylistHandler<?> handler =
+                playlistManager.getPlaylistHandler();
+        if (!(handler instanceof AudioPlaylistHandler)) {
+            return false;
+        }
+        AudioPlaylistHandler<?, ?> audioHandler = (AudioPlaylistHandler<?, ?>) handler;
+        com.devbrackets.android.playlistcore.api.MediaPlayerApi<?> mediaPlayer = audioHandler.getCurrentMediaPlayer();
+        if (mediaPlayer != null) {
+            audioHandler.resumePlaybackAfterVideoHandoff(positionMs);
+        } else {
+            // Re-prepare within the existing foreground service — do not call beginPlayback/startService.
+            audioHandler.startItemPlayback(positionMs, false);
+        }
+        playlistManager.setVideoHandoffForegroundRetain(false);
+        return true;
     }
 
     public float getLastKnownPositionSec() {
         return lastKnownHandoffPositionSec;
+    }
+
+    public void emitPlaybackSnapshot() {
+        AudioTrack currentItem = playlistManager.getCurrentItem();
+        if (currentItem == null) {
+            return;
+        }
+        JSONObject trackStatus = getPlayerStatus(currentItem);
+        onStatus(RmxAudioStatusMessage.RMXSTATUS_PLAYBACK_POSITION, currentItem.getTrackId(), trackStatus);
     }
 }

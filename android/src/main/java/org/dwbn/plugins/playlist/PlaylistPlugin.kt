@@ -7,6 +7,8 @@ import com.devbrackets.android.playlistcore.data.MediaProgress
 import com.getcapacitor.*
 import com.getcapacitor.annotation.CapacitorPlugin
 import org.dwbn.plugins.playlist.data.AudioTrack
+import org.dwbn.plugins.playlist.playlist.AudioPlaylistHandler
+import org.dwbn.plugins.playlist.service.MediaService
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.*
@@ -17,9 +19,10 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
     private var statusCallback: OnStatusCallback? = null
     private var audioPlayerImpl: RmxAudioPlayer? = null
     private var resetStreamOnPause = true
+    private var isWebViewActive = true
 
     override fun load() {
-        audioPlayerImpl = RmxAudioPlayer(this, (this.context.applicationContext as App))
+        audioPlayerImpl = RmxAudioPlayer(this, context.applicationContext)
     }
 
     @PluginMethod
@@ -94,19 +97,73 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
     fun addItem(call: PluginCall) {
         Handler(Looper.getMainLooper()).post {
             val item: JSONObject = call.getObject("item")
+            val index: Int = call.getInt("index", -1)!!
             val playerItem: AudioTrack? = getTrackItem(item)
-            audioPlayerImpl!!.getPlaylistManager().addItem(playerItem)
-
+            audioPlayerImpl!!.getPlaylistManager().addItem(playerItem, index)
 
             if (playerItem?.trackId != null) {
+                val payload = playerItem.toDict()
+                if (index >= 0) {
+                    payload.put("index", index.coerceIn(0, audioPlayerImpl!!.playlistManager.getAllItems().size - 1))
+                }
                 onStatus(
                     RmxAudioStatusMessage.RMXSTATUS_ITEM_ADDED,
                     playerItem.trackId,
-                    playerItem.toDict()
+                    payload
                 )
             }
             call.resolve()
             Log.i(TAG, "addItem")
+        }
+    }
+
+    @PluginMethod
+    fun moveItem(call: PluginCall) {
+        Handler(Looper.getMainLooper()).post {
+            val from: Int = call.getInt("from", -1)!!
+            val to: Int = call.getInt("to", -1)!!
+            val moved = audioPlayerImpl!!.playlistManager.moveItem(from, to)
+            if (!moved) {
+                call.reject("Index out of bounds")
+                return@post
+            }
+
+            val payload = JSONObject()
+            payload.put("from", from)
+            payload.put("to", to)
+            payload.put("currentIndex", audioPlayerImpl!!.playlistManager.currentPosition)
+            onStatus(
+                RmxAudioStatusMessage.RMXSTATUS_ITEM_MOVED,
+                audioPlayerImpl!!.playlistManager.currentItem?.trackId ?: "INVALID",
+                payload
+            )
+            call.resolve()
+            Log.i(TAG, "moveItem from=$from to=$to")
+        }
+    }
+
+    @PluginMethod
+    fun replaceItem(call: PluginCall) {
+        Handler(Looper.getMainLooper()).post {
+            val trackIndex: Int = call.getInt("index", -1)!!
+            val trackId: String = call.getString("id", "")!!
+            val item: JSONObject = call.getObject("item")
+            // An omitted trackId in the payload intentionally means "keep the existing id",
+            // so this must not be rejected the way a brand-new addItem() track would be.
+            val replacement: AudioTrack? = getTrackItem(item, requireTrackId = false)
+            val replaced = audioPlayerImpl!!.playlistManager.replaceItem(trackIndex, trackId, replacement)
+
+            if (replaced != null) {
+                onStatus(
+                    RmxAudioStatusMessage.RMXSTATUS_ITEM_REPLACED,
+                    replaced.trackId,
+                    replaced.toDict()
+                )
+                call.resolve()
+            } else {
+                call.reject("Could not find item!")
+            }
+            Log.i(TAG, "replaceItem")
         }
     }
 
@@ -156,8 +213,8 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
             val removals = ArrayList<TrackRemovalItem>()
             for (index in 0 until items.length()) {
                 val entry = items.optJSONObject(index) ?: continue
-                val trackIndex = entry.optInt("trackIndex", -1)
-                val trackId = entry.optString("trackId", "")
+                val trackIndex = entry.optInt("index", -1)
+                val trackId = entry.optString("id", "")
                 removals.add(TrackRemovalItem(trackIndex, trackId))
             }
 
@@ -213,20 +270,18 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
     fun play(call: PluginCall) {
         Handler(Looper.getMainLooper()).post {
             val handler = audioPlayerImpl!!.playlistManager.playlistHandler
+            val serviceForeground = MediaService.instance?.isRunningInForeground() == true
             if (handler == null || handler.currentMediaPlayer == null) {
-                // MediaPlayer was released or MediaService was killed (e.g. after a long video session
-                // where audio focus was permanently abandoned). Fall back to beginPlayback which
-                // re-starts the service, re-prepares the MediaPlayer, and re-acquires audio focus.
                 val posMs = (audioPlayerImpl!!.getLastKnownPositionSec() * 1000f).toLong()
-                audioPlayerImpl!!.playlistManager.beginPlayback(posMs, false)
-                Log.i(TAG, "play: handler/mediaPlayer was null — re-armed via beginPlayback at ${posMs}ms")
-            } else {
-                // Handler and MediaPlayer are alive — use the lightweight resume path.
-                // Guard against stacking up repeat cycles (playlistcore bug): skip if already playing.
-                val isPlaying = handler.currentMediaPlayer?.isPlaying ?: false
-                if (!isPlaying) {
-                    handler.play()
+                if (serviceForeground && handler is AudioPlaylistHandler<*, *>) {
+                    handler.startItemPlayback(posMs, false)
+                    Log.i(TAG, "play: re-armed via startItemPlayback at ${posMs}ms (FGS already foreground)")
+                } else {
+                    audioPlayerImpl!!.playlistManager.beginPlayback(posMs, false)
+                    Log.i(TAG, "play: handler/mediaPlayer was null — re-armed via beginPlayback at ${posMs}ms")
                 }
+            } else {
+                handler.play()
             }
 
             call.resolve()
@@ -256,11 +311,17 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
         Handler(Looper.getMainLooper()).post {
             val id: String = call.getString("id")!!
             if ("" != id) {
-                // alternatively we could search for the item and set the current index to that item.
-                val code = id.hashCode()
-                val seekPosition = (call.getFloat("position", 0f)!! * 1000.0f).toLong()
-                audioPlayerImpl!!.playlistManager.setCurrentItem(code.toLong())
-                audioPlayerImpl!!.playlistManager.beginPlayback(seekPosition, false)
+                val playlistManager = audioPlayerImpl!!.playlistManager
+                val position = playlistManager.findTrackPosition(id)
+                if (position >= 0) {
+                    val seekPosition = (call.getFloat("position", 0f)!! * 1000.0f).toLong()
+                    playlistManager.currentPosition = position
+                    val handler = playlistManager.playlistHandler
+                    val alreadyPlaying = handler?.currentMediaPlayer?.isPlaying == true
+                    if (!audioPlayerImpl!!.tryResumeVideoHandoffInPlace(seekPosition) && !alreadyPlaying) {
+                        playlistManager.beginPlayback(seekPosition, false)
+                    }
+                }
             }
 
             call.resolve()
@@ -293,13 +354,13 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
         Handler(Looper.getMainLooper()).post {
             val id: String = call.getString("id")!!
             if ("" != id) {
-                // alternatively we could search for the item and set the current index to that item.
-                val code = id.hashCode()
-                audioPlayerImpl!!.playlistManager.setCurrentItem(code.toLong())
-
-                val seekPosition = (call.getFloat("position", 0f)!! * 1000.0f).toLong()
-
-                audioPlayerImpl!!.playlistManager.beginPlayback(seekPosition, true)
+                val playlistManager = audioPlayerImpl!!.playlistManager
+                val position = playlistManager.findTrackPosition(id)
+                if (position >= 0) {
+                    val seekPosition = (call.getFloat("position", 0f)!! * 1000.0f).toLong()
+                    playlistManager.currentPosition = position
+                    playlistManager.beginPlayback(seekPosition, true)
+                }
             }
             call.resolve()
 
@@ -405,9 +466,14 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
     fun resumeAfterVideoHandoff(call: PluginCall) {
         Handler(Looper.getMainLooper()).post {
             val position = call.getFloat("position", 0f)!!
-            audioPlayerImpl!!.resumeAfterVideoHandoff(position)
-            call.resolve()
-            Log.i(TAG, "resumeAfterVideoHandoff")
+            val prewarm = call.getBoolean("prewarm", false) ?: false
+            // Default true preserves legacy Android in-place play when `play` is omitted.
+            val play = call.getBoolean("play", true) ?: true
+            val resumed = audioPlayerImpl!!.resumeAfterVideoHandoff(position, prewarm, play)
+            val result = JSObject()
+            result.put("resumed", resumed)
+            call.resolve(result)
+            Log.i(TAG, "resumeAfterVideoHandoff prewarm=$prewarm play=$play resumed=$resumed")
         }
     }
 
@@ -419,6 +485,19 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
             o.put("position", position.toDouble())
             call.resolve(o)
             Log.i(TAG, "getLastKnownPosition")
+        }
+    }
+
+    override fun handleOnPause() {
+        super.handleOnPause()
+        isWebViewActive = false
+    }
+
+    override fun handleOnResume() {
+        super.handleOnResume()
+        isWebViewActive = true
+        Handler(Looper.getMainLooper()).post {
+            audioPlayerImpl?.emitPlaybackSnapshot()
         }
     }
 
@@ -453,10 +532,10 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
         audioPlayerImpl!!.playlistManager.clearItems()
     }
 
-    private fun getTrackItem(item: JSONObject?): AudioTrack? {
+    private fun getTrackItem(item: JSONObject?, requireTrackId: Boolean = true): AudioTrack? {
         if (item != null) {
             val track = AudioTrack(item)
-            return if (track.trackId != null) {
+            return if (!requireTrackId || track.trackId != null) {
                 track
             } else null
         }
@@ -474,7 +553,41 @@ public class PlaylistPlugin : Plugin(), OnStatusReportListener {
         return trackItems
     }
 
+    fun emitStatus(what: RmxAudioStatusMessage, trackId: String?, param: JSONObject?) {
+        if (!shouldEmitStatusToBridge(what, isWebViewActive)) {
+            return
+        }
+        val data = JSObject()
+        val detail = JSObject()
+        detail.put("msgType", what.value)
+        detail.put("trackId", trackId)
+        detail.put("value", param)
+        data.put("action", "status")
+        data.put("status", detail)
+        Log.v(TAG, "statusChanged:$data")
+        notifyListeners("status", data, shouldRetainStatusEvent(what))
+    }
+
+    /** @deprecated Use [emitStatus] so retain/gating policy is applied consistently. */
     fun emit(name: String, data: JSObject) {
         this.notifyListeners(name, data, true)
+    }
+
+    companion object {
+        @JvmStatic
+        internal fun shouldEmitStatusToBridge(
+            what: RmxAudioStatusMessage,
+            isWebViewActive: Boolean
+        ): Boolean {
+            if (what == RmxAudioStatusMessage.RMXSTATUS_PLAYBACK_POSITION && !isWebViewActive) {
+                return false
+            }
+            return true
+        }
+
+        @JvmStatic
+        internal fun shouldRetainStatusEvent(what: RmxAudioStatusMessage): Boolean {
+            return what != RmxAudioStatusMessage.RMXSTATUS_PLAYBACK_POSITION
+        }
     }
 }

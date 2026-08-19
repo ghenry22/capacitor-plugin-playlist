@@ -1,19 +1,8 @@
 package org.dwbn.plugins.playlist
 
 import android.app.Application
-import org.dwbn.plugins.playlist.manager.PlaylistManager
 
-open class App : Application() {
-    private lateinit var _playlistManager: PlaylistManager;
-    val playlistManager get() = _playlistManager
-
-    fun resetPlaylistManager() {
-        _playlistManager = PlaylistManager(this)
-    }
-
-    override fun onCreate() {
-        resetPlaylistManager()
-        super.onCreate()
-
-    }
-}
+// Kept `open` (fork patch) so host apps that still subclass this (e.g. OptimalWork's
+// MainApplication) keep compiling until they migrate to a plain Application class.
+@Deprecated("No longer required; use your app's existing Application class")
+open class App : Application()

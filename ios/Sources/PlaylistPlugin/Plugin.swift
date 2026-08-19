@@ -9,7 +9,38 @@ protocol StatusUpdater {
  * here: https://capacitorjs.com/docs/plugins/ios
  */
 @objc(PlaylistPlugin)
-public class PlaylistPlugin: CAPPlugin, StatusUpdater {
+public class PlaylistPlugin: CAPPlugin, StatusUpdater, CAPBridgedPlugin {
+    public let identifier = "PlaylistPlugin"
+    public let jsName = "Playlist"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "setOptions", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "initialize", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "release", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setPlaylistItems", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "addItem", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "moveItem", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "replaceItem", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "addAllItems", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "removeItem", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "removeItems", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "clearAllItems", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getPlaylist", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "play", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "pause", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "skipForward", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "skipBack", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "seekTo", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "playTrackByIndex", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "playTrackById", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "selectTrackByIndex", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "selectTrackById", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setPlaybackVolume", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setLoop", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setPlaybackRate", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "prepareForVideoHandoff", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "resumeAfterVideoHandoff", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getLastKnownPosition", returnType: CAPPluginReturnPromise),
+    ]
     let audioPlayerImpl = RmxAudioPlayer()
     
     // MARK: - Capacitor API
@@ -21,7 +52,7 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
     }
     @objc func setOptions(_ call: CAPPluginCall) {
         // setOptions is invoked with the full payload as the options object.
-        audioPlayerImpl.setOptions(call.options as! [String : Any])
+        audioPlayerImpl.setOptions(call.jsObjectRepresentation)
         call.resolve()
     }
     @objc func release(_ call: CAPPluginCall) {
@@ -39,11 +70,56 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
     }
     @objc func addItem(_ call: CAPPluginCall) {
         let trackInfo = call.getObject("item")
-        
-        let track = AudioTrack.initWithDictionary(trackInfo)
-        audioPlayerImpl.addItem(track!)
-        
-        call.resolve();
+
+        guard let track = AudioTrack.initWithDictionary(trackInfo) else {
+            call.reject("Invalid track")
+            return
+        }
+
+        if let index = call.getInt("index") {
+            do {
+                try audioPlayerImpl.addItem(track, at: index)
+                call.resolve()
+            } catch {
+                call.reject(error.localizedDescription)
+            }
+            return
+        }
+
+        audioPlayerImpl.addItem(track)
+        call.resolve()
+    }
+
+    @objc func moveItem(_ call: CAPPluginCall) {
+        guard let from = call.getInt("from"), let to = call.getInt("to") else {
+            call.reject("Missing from or to index")
+            return
+        }
+
+        do {
+            try audioPlayerImpl.moveItem(from: from, to: to)
+            call.resolve()
+        } catch {
+            call.reject(error.localizedDescription)
+        }
+    }
+
+    @objc func replaceItem(_ call: CAPPluginCall) {
+        guard let trackInfo = call.getObject("item") else {
+            call.reject("Missing item")
+            return
+        }
+
+        do {
+            try audioPlayerImpl.replaceItem(
+                at: call.getInt("index"),
+                id: call.getString("id"),
+                with: trackInfo
+            )
+            call.resolve()
+        } catch {
+            call.reject(error.localizedDescription)
+        }
     }
     @objc func addAllItems(_ call: CAPPluginCall) {
         let items = call.getArray("items", [String:Any].self)!
@@ -119,9 +195,8 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
         do {
             try audioPlayerImpl.playTrack(index: index, positionTime: call.getFloat("position"))
             call.resolve();
-        }
-        catch let message {
-            call.reject(message as! String)
+        } catch {
+            call.reject(error.localizedDescription)
         }
     }
     @objc func playTrackById(_ call: CAPPluginCall) {
@@ -133,9 +208,8 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
         do {
             try audioPlayerImpl.playTrack(id, positionTime: call.getFloat("position"))
             call.resolve();
-        }
-        catch let message {
-            call.reject(message as! String)
+        } catch {
+            call.reject(error.localizedDescription)
         }
     }
     @objc func selectTrackByIndex(_ call: CAPPluginCall) {
@@ -147,9 +221,8 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
         do {
             try audioPlayerImpl.selectTrack(index: index)
             call.resolve();
-        }
-        catch let message {
-            call.reject(message as! String)
+        } catch {
+            call.reject(error.localizedDescription)
         }
     }
     @objc func selectTrackById(_ call: CAPPluginCall) {
@@ -161,9 +234,8 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
         do {
             try audioPlayerImpl.selectTrack(id: id)
             call.resolve();
-        }
-        catch let message {
-            call.reject(message as! String)
+        } catch {
+            call.reject(error.localizedDescription)
         }
     }
     @objc func setPlaybackVolume(_ call: CAPPluginCall) {
@@ -189,8 +261,13 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
 
     @objc func resumeAfterVideoHandoff(_ call: CAPPluginCall) {
         let position = call.getFloat("position", 0)
-        audioPlayerImpl.resumeAfterVideoHandoff(position: position)
-        call.resolve()
+        let prewarm = call.getBool("prewarm", false)
+        let play = call.getBool("play", false)
+        audioPlayerImpl.resumeAfterVideoHandoff(position: position, prewarm: prewarm, play: play) { resumed in
+            NSLog("[Playlist] resumeAfterVideoHandoff resolved prewarm=%@ play=%@ resumed=%@",
+                  prewarm ? "true" : "false", play ? "true" : "false", resumed ? "true" : "false")
+            call.resolve(["resumed": resumed])
+        }
     }
 
     @objc func getLastKnownPosition(_ call: CAPPluginCall) {
@@ -198,8 +275,31 @@ public class PlaylistPlugin: CAPPlugin, StatusUpdater {
         call.resolve(["position": position])
     }
 
+    public override func load() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+
+    @objc private func applicationWillResignActive() {
+        audioPlayerImpl.setWebViewActive(false)
+    }
+
+    @objc private func applicationDidBecomeActive() {
+        audioPlayerImpl.setWebViewActive(true)
+        audioPlayerImpl.emitPlaybackSnapshot()
+    }
+
     // MARK: - StatusUpdater delegate
-    // todo: calls to notifyListeners should be throttled
     func onStatus(_ data: [String: Any]) {
         notifyListeners("status", data: data)
     }
