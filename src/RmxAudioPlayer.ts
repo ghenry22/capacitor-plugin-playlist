@@ -3,9 +3,6 @@ import {
     RmxAudioStatusMessageDescriptions
 } from './Constants';
 import {
-    RemoveItemOptions
-} from './definitions';
-import {
     AudioPlayerEventHandler,
     AudioPlayerEventHandlers,
     AudioPlayerOptions,
@@ -182,14 +179,41 @@ export class RmxAudioPlayer {
     };
 
     /**
-     * Add a single track to the end of the playlist
+     * Add a single track to the end of the playlist, or at a specific index.
      */
-    addItem = (trackItem: AudioTrack) => {
+    addItem = (trackItem: AudioTrack, index?: number) => {
         const validTrackItem = validateTrack(trackItem);
         if (!validTrackItem) {
             throw new Error('Provided track is null or not an audio track');
         }
-        return Playlist.addItem({item: validTrackItem});
+        return Playlist.addItem({ item: validTrackItem, index });
+    };
+
+    /**
+     * Move a track within the playlist without disrupting playback of the current track.
+     */
+    moveItem = (from: number, to: number) => {
+        return Playlist.moveItem({ from, to });
+    };
+
+    /**
+     * Replace a track in the playlist (e.g. swap stream URL for a local file URL).
+     * Unlike addItem, the replacement is NOT run through validateTrack: an omitted
+     * `replacement.trackId` intentionally signals "keep the existing id", and
+     * validateTrack would otherwise auto-assign a new random UUID and defeat that.
+     */
+    replaceItem = (replacement: AudioTrack, spec: { index?: number; trackId?: string }) => {
+        if (!replacement) {
+            throw new Error('Provided track is null or not an audio track');
+        }
+        if (spec.index === undefined && !spec.trackId) {
+            throw new Error('Track replacement spec is invalid');
+        }
+        return Playlist.replaceItem({
+            item: replacement,
+            index: spec.index,
+            id: spec.trackId,
+        });
     };
 
     /**
@@ -206,10 +230,13 @@ export class RmxAudioPlayer {
         if (!removeItem) {
             throw new Error('Track removal spec is empty');
         }
-        if (!removeItem.trackId && !removeItem.trackIndex) {
-            new Error('Track removal spec is invalid');
+        if (!removeItem.trackId && removeItem.trackIndex === undefined) {
+            throw new Error('Track removal spec is invalid');
         }
-        return Playlist.removeItem({id: removeItem.trackId!, index: removeItem.trackIndex!});
+        return Playlist.removeItem({
+            id: removeItem.trackId,
+            index: removeItem.trackIndex
+        });
     };
 
     /**
@@ -217,7 +244,12 @@ export class RmxAudioPlayer {
      * include the currently playing item, the next available item will automatically begin playing.
      */
     removeItems = (items: AudioTrackRemoval[]) => {
-        return Playlist.removeItems({items: items as RemoveItemOptions[]});
+        return Playlist.removeItems({
+            items: (items || []).map((item) => ({
+                id: item?.trackId,
+                index: item?.trackIndex
+            }))
+        });
     };
 
     /**

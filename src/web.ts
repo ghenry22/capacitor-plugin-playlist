@@ -3,12 +3,14 @@ import { RmxAudioStatusMessage } from './Constants';
 import {
     AddAllItemOptions,
     AddItemOptions,
+    MoveItemOptions,
     PlayByIdOptions,
     PlayByIndexOptions,
     PlaylistOptions,
     PlaylistPlugin,
     RemoveItemOptions,
     RemoveItemsOptions,
+    ReplaceItemOptions,
     SeekToOptions,
     SelectByIdOptions,
     SelectByIndexOptions,
@@ -22,7 +24,7 @@ import { validateTrack, validateTracks } from './utils';
 declare var Hls: any;
 
 export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
-    protected audio: HTMLVideoElement | undefined;
+    protected audio: HTMLAudioElement | undefined;
     protected playlistItems: AudioTrack[] = [];
     protected loop = false;
     protected options: AudioPlayerOptions = {};
@@ -37,9 +39,81 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
     addItem(options: AddItemOptions): Promise<void> {
         const track = validateTrack(options.item);
         if (track) {
-            this.playlistItems.push(track);
-            this.updateStatus(RmxAudioStatusMessage.RMXSTATUS_ITEM_ADDED, track, track.trackId);
+            const insertIndex = options.index !== undefined && options.index !== null
+                ? Math.min(Math.max(0, options.index), this.playlistItems.length)
+                : this.playlistItems.length;
+            this.playlistItems.splice(insertIndex, 0, track);
+            // currentTrack is tracked by object reference, so getCurrentIndex() (indexOf)
+            // automatically reflects the shift caused by this insertion; no bookkeeping needed here.
+            this.updateStatus(
+                RmxAudioStatusMessage.RMXSTATUS_ITEM_ADDED,
+                { ...track, index: insertIndex },
+                track.trackId
+            );
         }
+        return Promise.resolve();
+    }
+
+    moveItem(options: MoveItemOptions): Promise<void> {
+        const { from, to } = options;
+        if (from < 0 || from >= this.playlistItems.length || to < 0 || to >= this.playlistItems.length) {
+            return Promise.reject(new Error('Index out of bounds'));
+        }
+        if (from === to) {
+            return Promise.resolve();
+        }
+        const [item] = this.playlistItems.splice(from, 1);
+        this.playlistItems.splice(to, 0, item);
+        this.updateStatus(
+            RmxAudioStatusMessage.RMXSTATUS_ITEM_MOVED,
+            { from, to, currentIndex: this.getCurrentIndex() },
+            item.trackId
+        );
+        return Promise.resolve();
+    }
+
+    async replaceItem(options: ReplaceItemOptions): Promise<void> {
+        let replaceIndex = -1;
+        if (options.index !== undefined && options.index !== null) {
+            replaceIndex = options.index;
+        } else if (options.id) {
+            replaceIndex = this.playlistItems.findIndex((t) => t.trackId === options.id);
+        }
+        if (replaceIndex < 0 || replaceIndex >= this.playlistItems.length) {
+            return Promise.reject(new Error('Could not find item to replace'));
+        }
+
+        const existing = this.playlistItems[replaceIndex];
+        const replacement = validateTrack({
+            ...options.item,
+            trackId: options.item.trackId ?? existing.trackId,
+        });
+        if (!replacement) {
+            return Promise.reject(new Error('Invalid replacement track'));
+        }
+
+        const isCurrent = this.currentTrack === existing;
+        let savedPosition = 0;
+        let wasPlaying = false;
+        if (isCurrent && this.audio) {
+            savedPosition = this.audio.currentTime;
+            wasPlaying = !this.audio.paused;
+        }
+
+        this.playlistItems[replaceIndex] = replacement;
+
+        if (isCurrent) {
+            await this.setCurrent(replacement, savedPosition);
+            if (!wasPlaying) {
+                await this.pause();
+            }
+        }
+
+        this.updateStatus(
+            RmxAudioStatusMessage.RMXSTATUS_ITEM_REPLACED,
+            replacement,
+            replacement.trackId
+        );
         return Promise.resolve();
     }
 
@@ -48,6 +122,10 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
         this.playlistItems = [];
         this.updateStatus(RmxAudioStatusMessage.RMXSTATUS_PLAYLIST_CLEARED, null, "INVALID");
         return Promise.resolve();
+    }
+
+    async getPlaylist(): Promise<{ items: AudioTrack[] }> {
+        return Promise.resolve({ items: this.playlistItems });
     }
 
     async initialize(): Promise<void> {
@@ -96,20 +174,37 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
     async release(): Promise<void> {
         await this.pause();
         this.audio = undefined;
+        this.currentTrack = null;
+        this.lastState = 'stopped';
+        return Promise.resolve();
+    }
+
+    async create(): Promise<void> {
+        this.audio = document.createElement('audio');
+        this.audio.crossOrigin = 'anonymous';
+        this.audio.preload = 'metadata';
+        this.audio.controls = true;
+        this.audio.autoplay = false;
         return Promise.resolve();
     }
 
     removeItem(options: RemoveItemOptions): Promise<void> {
-        this.playlistItems.forEach((item, index) => {
-            if (options.index && options.index === index) {
-                const removedTrack = this.playlistItems.splice(index, 1);
+        // options.index can be 0; don't use a truthy check.
+        let removeIndex: number = -1;
+        if (options.index !== undefined && options.index !== null) {
+            removeIndex = options.index;
+        } else if (options.id) {
+            removeIndex = this.playlistItems.findIndex((t) => t.trackId === options.id);
+        }
 
-                this.updateStatus(RmxAudioStatusMessage.RMXSTATUS_ITEM_REMOVED, removedTrack[0], removedTrack[0].trackId);
-            } else if (options.id && options.id === item.trackId) {
-                const removedTrack = this.playlistItems.splice(index, 1);
-                this.updateStatus(RmxAudioStatusMessage.RMXSTATUS_ITEM_REMOVED, removedTrack[0], removedTrack[0].trackId);
-            }
-        });
+        if (removeIndex >= 0 && removeIndex < this.playlistItems.length) {
+            const removedTrack = this.playlistItems.splice(removeIndex, 1)[0];
+            this.updateStatus(
+                RmxAudioStatusMessage.RMXSTATUS_ITEM_REMOVED,
+                removedTrack,
+                removedTrack?.trackId
+            );
+        }
         return Promise.resolve();
     }
 
@@ -182,48 +277,40 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
     }
 
     async skipForward(): Promise<void> {
-        let found: number | null = null;
-        this.playlistItems.forEach((item, index) => {
-            if (!found && this.getCurrentTrackId() === item.trackId) {
-                found = index;
+        const currentIndex = this.getCurrentIndex();
+        if (currentIndex < 0) {
+            return;
+        }
+
+        let targetIndex = currentIndex + 1;
+        if (targetIndex >= this.playlistItems.length) {
+            if (!this.loop) {
+                return;
             }
-        });
-
-        if (found === this.playlistItems.length - 1) {
-            found = -1;
+            targetIndex = 0;
         }
 
-        if (found !== null) {
-            this.updateStatus(RmxAudioStatusMessage.RMX_STATUS_SKIP_BACK, {
-                currentIndex: found + 1,
-                currentItem: this.playlistItems[found + 1]
-            }, this.playlistItems[found + 1].trackId);
-            return this.setCurrent(this.playlistItems[found + 1]);
-        }
-
-        return Promise.reject();
+        const targetTrack = this.playlistItems[targetIndex];
+        await this.setCurrent(targetTrack);
+        this.updateStatus(RmxAudioStatusMessage.RMX_STATUS_SKIP_FORWARD, {
+            currentIndex: targetIndex,
+            currentItem: targetTrack
+        }, targetTrack.trackId);
     }
 
     async skipBack(): Promise<void> {
-        let found: number | null = null;
-        this.playlistItems.forEach((item, index) => {
-            if (!found && this.getCurrentTrackId() === item.trackId) {
-                found = index;
-            }
-        });
-        if (found === 0) {
-            found = this.playlistItems.length - 1;
+        const currentIndex = this.getCurrentIndex();
+        if (currentIndex <= 0) {
+            return;
         }
 
-        if (found !== null) {
-            this.updateStatus(RmxAudioStatusMessage.RMX_STATUS_SKIP_BACK, {
-                currentIndex: found - 1,
-                currentItem: this.playlistItems[found - 1]
-            }, this.playlistItems[found - 1].trackId);
-            return this.setCurrent(this.playlistItems[found - 1]);
-        }
-
-        return Promise.reject();
+        const targetIndex = currentIndex - 1;
+        const targetTrack = this.playlistItems[targetIndex];
+        await this.setCurrent(targetTrack);
+        this.updateStatus(RmxAudioStatusMessage.RMX_STATUS_SKIP_BACK, {
+            currentIndex: targetIndex,
+            currentItem: targetTrack
+        }, targetTrack.trackId);
     }
 
     setPlaybackRate(options: SetPlaybackRateOptions): Promise<void> {
@@ -232,6 +319,23 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
             return Promise.resolve();
         }
         return Promise.reject();
+    }
+
+    protected lastKnownHandoffPosition = 0;
+
+    async prepareForVideoHandoff(): Promise<void> {
+        this.lastKnownHandoffPosition = this.audio?.currentTime ?? 0;
+        await this.pause();
+        return Promise.resolve();
+    }
+
+    async resumeAfterVideoHandoff(options: { position: number }): Promise<{ resumed: boolean }> {
+        this.lastKnownHandoffPosition = options.position;
+        return Promise.resolve({ resumed: false });
+    }
+
+    async getLastKnownPosition(): Promise<{ position: number }> {
+        return Promise.resolve({ position: this.lastKnownHandoffPosition });
     }
 
     async setMediaSessionRemoteControlMetadata(): Promise<void> {
@@ -343,6 +447,11 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
             this.audio.addEventListener('durationchange', () => {
                 this.updateStatus(RmxAudioStatusMessage.RMXSTATUS_DURATION, this.getCurrentTrackStatus(this.lastState));
             });
+
+            this.audio.addEventListener('seeking', () => {
+                const status = this.getCurrentTrackStatus(this.lastState);
+                this.updateStatus(RmxAudioStatusMessage.RMXSTATUS_SEEK, status);
+            });
         }
     }
 
@@ -354,14 +463,7 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
     }
 
     protected getCurrentIndex() {
-        if (this.currentTrack) {
-            for (let i = 0; i < this.playlistItems.length; i++) {
-                if (this.playlistItems[i].trackId === this.currentTrack.trackId) {
-                    return i;
-                }
-            }
-        }
-        return -1;
+        return this.currentTrack ? this.playlistItems.indexOf(this.currentTrack) : -1;
     }
 
     protected getCurrentTrackStatus(currentState: string) {
@@ -380,17 +482,10 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
         let wasPlaying = false;
         if (this.audio) {
             wasPlaying = !this.audio.paused;
-            this.audio.pause();
-            this.audio.src = '';
-            this.audio.removeAttribute('src');
-            this.audio.load();
+            await this.release();
         }
-        this.audio = document.createElement('video');
-        if (wasPlaying || forceAutoplay) {
-            this.audio.addEventListener('canplay', () => {
-                this.play();
-            });
-        }
+        await this.create();
+
         this.currentTrack = item;
         if (item.assetUrl.includes('.m3u8')) {
             await this.loadHlsJs();
@@ -407,7 +502,7 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
 
             //this.registerHlsListeners(hls, position);
         } else {
-            this.audio.src = item.assetUrl;
+            this.audio!.src = item.assetUrl;
         }
 
         await this.registerHtmlListeners(position);
@@ -415,7 +510,15 @@ export class PlaylistWeb extends WebPlugin implements PlaylistPlugin {
         this.updateStatus(RmxAudioStatusMessage.RMXSTATUS_TRACK_CHANGED, {
             currentItem: item
         })
+
+        if (wasPlaying || forceAutoplay) {
+            //this.play();
+            this.audio!.addEventListener('canplay', () => {
+                this.play();
+            });
+        }
     }
+
     protected updateStatus(msgType: RmxAudioStatusMessage, value: any, trackId?: string) {
         this.notifyListeners('status', {
             action: 'status',
