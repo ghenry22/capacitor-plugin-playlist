@@ -54,6 +54,15 @@ class MediaImageProvider(
             if (notificationIconId <= 0) {
                 notificationIconId = fakeR.getId("drawable", options?.icon)
             }
+            if (notificationIconId <= 0) {
+                // Posting a notification with small icon 0 throws
+                // "Invalid notification (no valid small icon)" and kills the
+                // host app on the first play. A host can lose the drawable
+                // without noticing (e.g. shrinkResources strips a resource
+                // that is only referenced by name), so fall back to the
+                // launcher icon instead of crashing.
+                notificationIconId = fakeR.context.applicationInfo.icon
+            }
             return notificationIconId
         }
 
